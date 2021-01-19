@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<head>
+<title>Aufgabe 4 - WebGL demo</title>
+</head>
+<body style="margin: 0; padding: 0; overflow: hidden;">
+<canvas width="640" height="360" display="block"></canvas>
+<script src="gl-matrix.js"></script>
+<script src="matrixgl.min.js"></script>
+<script>
+const {vec3, quat} = glMatrix;
+function deg2rad(degrees) { return Math.PI * degrees / 180; }
+const GL = WebGL2RenderingContext.prototype;
+class ContextualWebGLProgram extends WebGLProgram {
+    /** @type {WebGL2RenderingContext} */
+    context;
+    constructor() {
+        throw new Error("Use ContextualWebGLProgram.create");
+    }
+    /** 
+     * @param {WebGL2RenderingContext} context
+     * @return {ContextualWebGLProgram}
+     */
+    static create(context) {
+        return Object.assign(Object.setPrototypeOf(context.createProgram(), this.prototype), {context});
+    }
+    addShader(type, source) {
+        const ctx = this.context;
+        const shader = ctx.createShader(type);
+        ctx.shaderSource(shader, source);
+        ctx.compileShader(shader);
+        const info = ctx.getShaderInfoLog(shader);
+        if (!ctx.getShaderParameter(shader, GL.COMPILE_STATUS)) {
+            ctx.deleteShader(shader);
+            throw new Error(info);
+        }
+        ctx.attachShader(this, shader);
+        return shader;
+    }
+    link() {
+        const ctx = this.context;
+        ctx.linkProgram(this);
+        const info = ctx.getProgramInfoLog(this);
+        if (!ctx.getProgramParameter(this, GL.LINK_STATUS)) {
+            ctx.deleteProgram(this);
+            throw new Error(info);
+        }
+    }
+    use() {
+        this.context.useProgram(this);
+    }
+    get attributes() {
+        Object.defineProperty(this, "attributes", {
+            value: new Proxy({}, {
+                get: (map, name) => {
+                    const loc = map[name] ?? (map[name] = this.context.getAttribLocation(this, name));
+                    if (loc < 0) throw new Error(`Attribute "${name}" not found in shader`);
+                    return loc;
+                }
+            })
+        });
+        return this.attributes;
+    }
+    get uniforms() {
+        Object.defineProperty(this, "uniforms", {
+            value: new Proxy({}, {
+                get: (map, name) => {
+                    const loc = map[name] ?? (map[name] = this.context.getUniformLocation(this, name));
+                    if (!loc) throw new Error(`Uniform "${name}" not found in shader`);
+                    return loc;
+                }
+            })
+        });
+        return this.uniforms;
+    }
+    
+}
+</script>
+<script id="vertexShader" type="text/webgl">// #version 300 es
+
+struct Matrices {
+    // model-view-projection matrix, for transformation from object space into clip space
+    mat4 mvp;
+    // model-view matrix, for transformation from object space into eye space
+    mat4 mv;
+    // transposed inverse of model-view matrix, for transformation of normal vectors from object space into eye space
+    mat3 normal;
+};
+struct Light {
+    // position in eye space
+    vec3 position;
+    vec4 color;
+};
+
+attribute vec4 vertex;
+attribute vec3 normal;
+uniform Matrices matrices;
+uniform Light light;
+
+// normal vector on vertex (eye space)
+varying vec3 vertexNormal;
+// vector from vertex to light source (eye space)
+varying vec3 vertexLightDir;
+// vector from vertex to eye position (eye space)
+varying vec3 vertexViewDir;
+
+void main() {
+    gl_Position = matrices.mvp * vertex;
+    // gl_Position = vertex;
+
+    vertexNormal = matrices.normal * normal;
+
+    vec4 pos = matrices.mv * vertex;
+    vec3 mvPos = pos.xyz / pos.w;
+
+    vertexLightDir = light.position - mvPos;
+    vertexViewDir = -mvPos;
+}
+</script>
+<script id="fragmentShader" type="text/webgl">
+precision highp float;
+
+struct Matrices {
+    mat4 mvp;
+    mat4 mv;
+    mat3 normal;
+};
+struct Light {
+    // position in eye space
+    vec3 position;
+    vec4 color;
+};
+struct MaterialParams {
+    // vec4 emission;
+    vec4 ambient;
+    vec4 diffuse;
+    vec4 specular;
+    float shininess;
+};
+
+varying vec3 vertexNormal;
+varying vec3 vertexLightDir;
+varying vec3 vertexViewDir;
+
+uniform Matrices matrices;
+uniform Light light;
+uniform MaterialParams material;
+
+void main() {
+    vec3 viewDir = normalize(vertexViewDir);
+    vec3 lightDir = normalize(vertexLightDir);
+    vec3 normal = normalize(vertexNormal);
+    vec3 halfway = normalize(viewDir + lightDir);
+
+    float diffusion = max(dot(normal, lightDir), 0.0);
+    float reflection = diffusion > 0.0 ? pow(max(dot(halfway, normal), 0.0), material.shininess) : 0.0;
+
+    vec4 emissiveColor = vec4(0, 0, 0, 1);
+    vec4 ambientColor = material.ambient * light.color; // * 0.2
+    vec4 diffuseColor = diffusion * material.diffuse * light.color;
+    vec4 specularColor = reflection * material.specular * light.color;
+
+    gl_FragColor = emissiveColor + ambientColor + diffuseColor + specularColor;
+    // out_color.r = diffusion;
+    // out_color.g = 0;
+    // out_color.b = 1-diffusion;
+    gl_FragColor.a = light.color.a;
+}
+</script>
+<script>
+const canvas = document.querySelector("canvas");
+const ctx = canvas.getContext("webgl2");
+window.onresize = window.onload = e => {
+    // TODO: https://webglfundamentals.org/webgl/lessons/webgl-anti-patterns.html
+    canvas.width = document.documentElement.clientWidth;
+    canvas.height = document.documentElement.clientHeight;
+    ctx.viewport(0, 0, canvas.width, canvas.height);
+};
+window.status = ctx.getParameter(GL.SHADING_LANGUAGE_VERSION);
+ctx.clearColor(0, 0, 0, 1);
+ctx.enable(GL.DEPTH_TEST);
+ctx.enable(GL.BLEND);
+ctx.blendFunc(GL.SRC_ALPHA, GL.ONE_MINUS_SRC_ALPHA);
+
+const program = ContextualWebGLProgram.create(ctx);
+const vertexShader = program.addShader(GL.VERTEX_SHADER, document.getElementById("vertexShader").textContent);
+const fragmentShader = program.addShader(GL.FRAGMENT_SHADER, document.getElementById("fragmentShader").textContent);
+program.link();
+
+// const numUniforms = ctx.getProgramParameter(program, GL.ACTIVE_UNIFORMS);
+// for (let i = 0; i < numUniforms; ++i) {
+//   // get the name, type, and size of a uniform
+//   const info = ctx.getActiveUniform(program, i);
+//   // get the location of that uinform
+//   const loc = ctx.getUniformLocation(program, info.name);
+//   console.log(info, loc)
+// }
+
+const drawTriangle = (() => {
+    const data = new Float32Array([
+        0, 0.5, 0,
+        0.5, -0.5, 0,
+        -0.5, -0.5, 0,
+        0, 0, 1,
+        0, 0, 1,
+        0, 0, 1,
+    ]);
+    const VAO = ctx.createVertexArray();
+    ctx.bindVertexArray(VAO);
+    const VBO = ctx.createBuffer();
+    ctx.bindBuffer(GL.ARRAY_BUFFER, VBO);
+    ctx.bufferData(GL.ARRAY_BUFFER, data, GL.STATIC_DRAW);
+
+    ctx.enableVertexAttribArray(program.attributes["vertex"]);
+    ctx.vertexAttribPointer(program.attributes["vertex"], 3, GL.FLOAT, false, 0, 0);
+    // ctx.bindBuffer(GL.ARRAY_BUFFER, VBO);
+    ctx.enableVertexAttribArray(program.attributes["normal"]);
+    ctx.vertexAttribPointer(program.attributes["normal"], 3, GL.FLOAT, false, 0, 3 * 3 * data.BYTES_PER_ELEMENT);
+
+    return () => {
+        ctx.bindVertexArray(VAO);
+        ctx.drawArrays(GL.TRIANGLES, 0, 3);
+    }
+})();
+
+const drawCube = (() => {
+    // Geometrie
+    const vertices = [
+        [-1,  1, -1],
+        [-1,  1,  1],
+        [-1, -1,  1],
+        [ 1, -1,  1],
+        [ 1, -1, -1],
+        [ 1,  1, -1],
+    ];
+    const normals = [
+        [ 1, 0, 0],
+        [-1, 0, 0],
+        [0,  1, 0],
+        [0, -1, 0],
+        [0, 0,  1],
+        [0, 0, -1],
+    ];
+    const data = [];
+    for (let i = 0; i < 6; i++) {
+        data.push([-1, -1, -1]);        // bottom corner
+        data.push(vertices[i]);         // corner a
+        data.push(vertices[(i+1) % 6]); // corner b
+        data.push([ 1,  1,  1]);        // top corner
+        data.push(vertices[(i+1) % 6]); // corner b
+        data.push(vertices[i]);         // corner a
+    }
+    const vertsToDraw = data.length;
+    for (let i = 0; i < 6; i++) {
+        for (let j = 0; j < 3; j++)
+            data.push(normals[i | 1]);            // downwards (to the resp side)
+        for (let j = 0; j < 3; j++)
+            data.push(normals[((i+3) % 6) & ~1]); // upwards (to the resp side)
+    }
+    const bytes = new Float32Array(data.flat());
+
+    const VAO = ctx.createVertexArray();
+    ctx.bindVertexArray(VAO);
+    const VBO = ctx.createBuffer();
+    ctx.bindBuffer(GL.ARRAY_BUFFER, VBO);
+    ctx.bufferData(GL.ARRAY_BUFFER, bytes, GL.STATIC_DRAW);
+
+    ctx.enableVertexAttribArray(program.attributes["vertex"]);
+    ctx.vertexAttribPointer(program.attributes["vertex"], 3, GL.FLOAT, false, 0, 0);
+    ctx.enableVertexAttribArray(program.attributes["normal"]);
+    ctx.vertexAttribPointer(program.attributes["normal"], 3, GL.FLOAT, false, 0, vertsToDraw * 3 * bytes.BYTES_PER_ELEMENT);
+
+    return () => {
+        ctx.bindVertexArray(VAO);
+        ctx.drawArrays(GL.TRIANGLES, 0, vertsToDraw);
+    };
+})();
+
+const drawCone = (() => {
+    // Geometrie
+    const basevertices = [];
+    const basenormals = [];
+
+    const height = 2.0;
+    const step = 2 * Math.PI / 32;
+
+    for (let i = 0; i < 32; i++) {
+        const x = Math.sin(i * step);
+        const z = Math.cos(i * step);
+        basevertices.push(new Vector3(x, 0, z));
+        basenormals.push(new Vector3(x, 1 / height, z));
+    }
+    const top = new Vector3(0, height, 0);
+    const vertsToDraw = 3 * 32;
+
+    const data = new Float32Array(2 * vertsToDraw * 3);
+    for (let i = 0; i < basevertices.length; i++) {
+        const next = (i + 1) % basevertices.length;
+
+        const topnormal = basenormals[i].add(basenormals[next]).normalize();
+
+        data.set(basevertices[i].values,    3*(6*i+0));
+        data.set(basenormals[i].values,     3*(6*i+1));
+        data.set(top.values,                3*(6*i+2));
+        data.set(topnormal.values,          3*(6*i+3));
+        data.set(basevertices[next].values, 3*(6*i+4));
+        data.set(basenormals[next].values,  3*(6*i+5));
+    }
+
+    const VAO = ctx.createVertexArray();
+    ctx.bindVertexArray(VAO);
+    const VBO = ctx.createBuffer();
+    ctx.bindBuffer(GL.ARRAY_BUFFER, VBO);
+    ctx.bufferData(GL.ARRAY_BUFFER, data, GL.STATIC_DRAW);
+
+    ctx.enableVertexAttribArray(program.attributes["vertex"]);
+    ctx.vertexAttribPointer(program.attributes["vertex"], 3, GL.FLOAT, false, 6 * data.BYTES_PER_ELEMENT, 0);
+    ctx.enableVertexAttribArray(program.attributes["normal"]);
+    ctx.vertexAttribPointer(program.attributes["normal"], 3, GL.FLOAT, false, 6 * data.BYTES_PER_ELEMENT, 3 * data.BYTES_PER_ELEMENT);
+
+    return () => {
+        ctx.bindVertexArray(VAO);
+        ctx.drawArrays(GL.TRIANGLES, 0, vertsToDraw);
+    };
+})();
+
+const {drawCylinderMantle, drawCylinderBottom} = (() => {
+    // Geometrie
+    const vertsToDraw = 2 * 33;
+    const data = new Float32Array(2 * vertsToDraw * 3);
+    const step = 2 * Math.PI / 32;
+
+    for (let i = 0; i < 33; i++) {
+        const x = Math.sin(i * step);
+        const z = Math.cos(i * step);
+        data.set([x, 0, z], 3*(4*i+0)); // bottom vertex
+        data.set([x, 0, z], 3*(4*i+1)); // bottom normal
+        data.set([x, 1, z], 3*(4*i+2)); // top vertex
+        data.set([x, 0, z], 3*(4*i+3)); // top normal
+    }
+
+    const mantleVAO = ctx.createVertexArray();
+    ctx.bindVertexArray(mantleVAO);
+    const VBO = ctx.createBuffer();
+    ctx.bindBuffer(GL.ARRAY_BUFFER, VBO);
+    ctx.bufferData(GL.ARRAY_BUFFER, data, GL.STATIC_DRAW);
+
+    ctx.enableVertexAttribArray(program.attributes["vertex"]);
+    ctx.vertexAttribPointer(program.attributes["vertex"], 3, GL.FLOAT, false, 6 * data.BYTES_PER_ELEMENT, 0);
+    ctx.enableVertexAttribArray(program.attributes["normal"]);
+    ctx.vertexAttribPointer(program.attributes["normal"], 3, GL.FLOAT, false, 6 * data.BYTES_PER_ELEMENT, 3 * data.BYTES_PER_ELEMENT);
+
+    const circleVAO = ctx.createVertexArray();
+    ctx.bindVertexArray(circleVAO);
+    ctx.bindBuffer(GL.ARRAY_BUFFER, VBO); // still bound, but nonetheless
+
+    ctx.enableVertexAttribArray(program.attributes["vertex"]);
+    ctx.vertexAttribPointer(program.attributes["vertex"], 3, GL.FLOAT, false, 12 * data.BYTES_PER_ELEMENT, 0);
+    return {
+        drawCylinderMantle() {
+            ctx.bindVertexArray(mantleVAO);
+            ctx.drawArrays(GL.TRIANGLE_STRIP, 0, vertsToDraw);
+        },
+        drawCylinderBottom() {
+            ctx.bindVertexArray(circleVAO);
+            ctx.vertexAttrib3f(program.attributes["normal"], 0, -1, 0);
+            ctx.drawArrays(GL.TRIANGLE_FAN, 0, 32);
+        },
+    };
+})();
+
+const makeTesselator = (vertices, tesselation, index) => {
+    const indices = [];
+    const cache = new Map();
+    function middle(a, b) {
+        const key = `${Math.min(a, b)}-${Math.max(a, b)}`;
+        if (!cache.has(key)) {
+            vec3.add(vertices[index], vertices[a], vertices[b]);
+            vec3.normalize(vertices[index], vertices[index]);
+            cache.set(key, index++);
+        }
+        return cache.get(key);
+    }
+    function tessalateTriangle(level, a, b, c) {
+        if (level == 1) {
+            indices.push(a, b, c);
+        } else {
+            const ab = middle(a, b);
+            const bc = middle(b, c);
+            const ca = middle(c, a);
+            tessalateTriangle(level-1, a, ab, ca);
+            tessalateTriangle(level-1, ab, bc, ca);
+            tessalateTriangle(level-1, ab, b, bc);
+            tessalateTriangle(level-1, bc, c, ca);
+        }
+    }
+    return {
+        indices,
+        addTriangle(a, b, c) {
+            tessalateTriangle(tesselation, a, b, c);
+        }
+    };
+};
+const makeSphericalDraw = (vertexData, indexData) => {
+    const vertsToDraw = indexData.length;
+
+    const VAO = ctx.createVertexArray();
+    ctx.bindVertexArray(VAO);
+    const VBO = ctx.createBuffer();
+    ctx.bindBuffer(GL.ARRAY_BUFFER, VBO);
+    ctx.bufferData(GL.ARRAY_BUFFER, vertexData, GL.STATIC_DRAW);
+
+    ctx.enableVertexAttribArray(program.attributes["vertex"]);
+    ctx.vertexAttribPointer(program.attributes["vertex"], 3, GL.FLOAT, false, 0, 0);
+    ctx.enableVertexAttribArray(program.attributes["normal"]);
+    ctx.vertexAttribPointer(program.attributes["normal"], 3, GL.FLOAT, false, 0, 0);
+
+    const IAO = ctx.createBuffer();
+    ctx.bindBuffer(GL.ELEMENT_ARRAY_BUFFER, IAO);
+    ctx.bufferData(GL.ELEMENT_ARRAY_BUFFER, indexData, GL.STATIC_DRAW);
+
+    return () => {
+        ctx.bindVertexArray(VAO);
+        if (parameters.wireframe)
+            for (let i=0; i<vertsToDraw; i+=3)
+                ctx.drawElements(GL.LINE_LOOP, 3, GL.UNSIGNED_SHORT, i*indexData.BYTES_PER_ELEMENT);
+        else
+            ctx.drawElements(GL.TRIANGLES, vertsToDraw, GL.UNSIGNED_SHORT, 0);
+    };
+}
+const drawTetraSphere = (tesselation => {
+    // Geometrie
+    // v(n) = v(n-1)+e(n-1),  e(n) = 2*e(n-1)+3*f(n-1),  f(n)=4*f(n-1)
+    // tess 1:   4 vertices,   6 edges,   4 faces
+    // tess 2:  10 vertices,  24 edges,  16 faces
+    // tess 3:  34 vertices,  96 edges,  64 faces
+    // tess 4: 130 vertices, 384 edges, 128 faces
+    // tess 5: ...
+    const vertexData = new Float32Array(3 * (2 + 4**tesselation / 2));
+    const vertices = Array.from({length: 2 + 4**tesselation / 2}, (_,i) => vertexData.subarray(3*i, 3*i+3));
+    // https://en.wikipedia.org/wiki/Tetrahedron#Coordinates_for_a_regular_tetrahedron
+    vertexData.set([
+         Math.sqrt(8/9),               0, -1/3,
+        -Math.sqrt(2/9),  Math.sqrt(2/3), -1/3,
+        -Math.sqrt(2/9), -Math.sqrt(2/3), -1/3,
+                      0,               0,    1,
+    ]);
+    const tesselate = makeTesselator(vertices, tesselation, 4);
+    tesselate.addTriangle(0, 2, 1);
+    tesselate.addTriangle(0, 2, 3);
+    tesselate.addTriangle(2, 1, 3);
+    tesselate.addTriangle(1, 0, 3);
+    return makeSphericalDraw(vertexData, new Uint16Array(tesselate.indices));
+})(4);
+
+const drawOctoSphere = (tesselation => {
+    // Geometrie
+    // v(n) = v(n-1)+e(n-1),  e(n) = 2*e(n-1)+3*f(n-1),  f(n)=4*f(n-1)
+    // tess 0:   3 vertices,   3 edges,   2 faces
+    // tess 1:   6 vertices,  12 edges,   8 faces
+    // tess 2:  18 vertices,  48 edges,  32 faces
+    // tess 3:  66 vertices, 192 edges, 128 faces
+    // tess 4: 258 vertices, 768 edges, 512 faces
+    // tess 5: ...
+    const vertexData = new Float32Array(3 * (2 + 4**tesselation));
+    const vertices = Array.from({length: 2 + 4**tesselation}, (_,i) => vertexData.subarray(3*i, 3*i+3));
+    vertexData.set([
+         1,  0,  0,
+         0,  1,  0,
+        -1,  0,  0,
+         0, -1,  0,
+         0,  0,  1,
+         0,  0, -1,
+    ]);
+    const tesselate = makeTesselator(vertices, tesselation, 6);
+    for (let i=0; i<4; i++) {
+        tesselate.addTriangle(4, i, (i+1)%4);
+        tesselate.addTriangle((i+1)%4, i, 5);
+    }
+    return makeSphericalDraw(vertexData, new Uint16Array(tesselate.indices));
+})(4);
+
+// mutated throug key events
+let view = Matrix4.lookAt(new Vector3(0, 5, 10), new Vector3(0, 0, 0), new Vector3(0, 1, 0)); // Y is up!
+let globalRotation = new Quaternion(0, 0, 0, 1);
+// mutated by UI elements
+const parameters = {
+    wireframe: false,
+    material: "gold",
+    advent: 3,
+    lightColor: [1, 1, 1, 1],
+}
+
+const materials = {
+    sun:      [new Vector4(1,   1,   1,   1 ), new Vector4(0,   0,   0,   0 ), new Vector4(0,   0,   0,   0 ), 0   ],
+    bronze:   [new Vector4(.21, .13, .05, 1 ), new Vector4(.71, .43, .18, 1 ), new Vector4(.39, .27, .17, 1 ), 25.6],
+    obsidian: [new Vector4(.05, .05, .07, .8), new Vector4(.18, .17, .23, .8), new Vector4(.33, .33, .35, .8), 38.4],
+    gold:     [new Vector4(.25, .20, .07, 1 ), new Vector4(.75, .61, .23, 1 ), new Vector4(.63, .56, .37, 1 ), 51.2],
+    smaragd:  [new Vector4(.02, .17, .02, .5), new Vector4(.08, .61, .08, .5), new Vector4(.63, .73, .63, .5), 76.8],
+    jade:     [new Vector4(.14, .22, .16, .9), new Vector4(.54, .89, .63, .9), new Vector4(.32, .32, .32, .9), 12.8],
+    ruby:     [new Vector4(.17, .01, .01, .5), new Vector4(.61, .04, .04, .5), new Vector4(.73, .63, .63, .5), 76.8],
+};
+function setMaterial(name) {
+    ctx.uniform4fv(program.uniforms["material.ambient"], materials[name][0].values);
+    ctx.uniform4fv(program.uniforms["material.diffuse"], materials[name][1].values);
+    ctx.uniform4fv(program.uniforms["material.specular"], materials[name][2].values);
+    ctx.uniform1f(program.uniforms["material.shininess"], materials[name][3]);
+}
+function setModelMatrices(model) {
+    const projection = Matrix4.perspective({fovYRadian: Math.PI/5, aspectRatio: canvas.width/canvas.height, near: .1, far: 200});
+    const modelView = view.mulByMatrix4(model);
+    const normal = glMatrix.mat3.normalFromMat4(glMatrix.mat3.create(), modelView.values);
+    ctx.uniformMatrix4fv(program.uniforms["matrices.mvp"], false, projection.mulByMatrix4(modelView).values);
+    ctx.uniformMatrix4fv(program.uniforms["matrices.mv"], false, modelView.values);
+    ctx.uniformMatrix3fv(program.uniforms["matrices.normal"], false, normal);
+}
+
+(async function() {
+    // polygon mode not available in webgl
+    // if (parameter.wireframe) {}
+
+    let frames = [];
+    while (true) {
+        const now = await new Promise(requestAnimationFrame);
+        ctx.clear(GL.COLOR_BUFFER_BIT | GL.DEPTH_BUFFER_BIT);
+        program.use();
+        ctx.uniform3f(program.uniforms["light.position"], 0, 0, 1);
+        ctx.uniform4fv(program.uniforms["light.color"], parameters.lightColor);
+        setMaterial(parameters.material);
+
+        const scaler = (now / 10000) % 1;
+        const globalModel = globalRotation.toRotationMatrix4();
+        for (let i = 0; i < 8; i++) {
+            setModelMatrices(globalModel.rotateY(deg2rad(i * 45 + 22.)).translate(4, 0, 0).scale(0.7, 0.7, 0.7));
+            // drawTetraSphere();
+            drawOctoSphere();
+        }
+
+        // center
+        setModelMatrices(globalModel.translate(0, -.6, 0).rotateY(deg2rad(scaler * 90)).scale(3, .1, 3));
+        drawCube();
+
+        // decorative cubes
+        for (let i = 0; i < 4; i++) {
+            setModelMatrices(globalModel.rotateY(deg2rad(i * 90)).translate(4, 0, 0).scale(.5, .5, .5));
+            drawCube();
+        }
+
+        // candles
+        // Zylinder-Mantel
+        for (let i = 0; i < 4; i++) {
+            let turn = scaler + i / 4;
+            if (turn > 1) turn -= 1;
+            let candleburn = 1 - turn;
+
+            if (i >= parameters.advent) candleburn = 1; // :-)
+
+            let candlebottom = -.7;
+            if (candleburn < .1) {
+                candlebottom = candleburn * candleburn * 500 - .7;
+                candleburn = 1;
+            }
+
+            setMaterial("ruby");
+
+            setModelMatrices(globalModel.rotateY(deg2rad(i * 90 + 45)).translate(4, candlebottom, 0).scale(0.5, candleburn * 2, 0.5));
+            drawCylinderMantle();
+
+            // Zylinder-Boden
+            setModelMatrices(globalModel.rotateY(deg2rad(i * 90 + 45)).translate(4, candlebottom, 0).scale(0.5, 1, 0.5));
+            drawCylinderBottom();
+
+            // cone
+            setModelMatrices(globalModel.rotateY(deg2rad(i * 90 + 45)).translate(4, candleburn * 2 + candlebottom, 0).scale(0.5, 0.1, 0.5));
+            drawCone();
+
+            // flame
+            if (candleburn == 1) continue;
+            setModelMatrices(globalModel.rotateY(deg2rad(i * 90 + 45)).translate(4, candleburn * 2 + .3 + candlebottom, 0).rotateY(scaler * 72000).scale(0.1, 0.3, 0.5)); // a billboard would've been nice. But it fast rotation flickers even better!
+
+            setMaterial("sun");
+            drawTriangle();
+        }
+
+        frames.push(now);
+        while (now - frames[0] > 500) frames.shift();
+        document.getElementById("fps").textContent = Math.round(1000/(now-frames[0])*frames.length)+" FPS";
+    }
+}());
+
+window.addEventListener("keydown", event => {
+    switch (event.code) {
+        case "ArrowDown":
+        case "ArrowUp":
+        case "ArrowLeft":
+        case "ArrowRight":
+            break;
+        case "KeyW":
+            quat.multiply(globalRotation.values, globalRotation.values, quat.fromEuler(quat.create(), -30, 0, 0));
+            break;
+        case "KeyS":
+            quat.multiply(globalRotation.values, globalRotation.values, quat.fromEuler(quat.create(),  30, 0, 0));
+            break;
+        case "KeyA":
+            quat.multiply(globalRotation.values, globalRotation.values, quat.fromEuler(quat.create(), 0, -30, 0));
+            break;
+        case "KeyD":
+            quat.multiply(globalRotation.values, globalRotation.values, quat.fromEuler(quat.create(), 0,  30, 0));
+            break;
+        case "KeyQ":
+            quat.multiply(globalRotation.values, globalRotation.values, quat.fromEuler(quat.create(), 0, 0, -30));
+            break;
+        case "KeyE":
+            quat.multiply(globalRotation.values, globalRotation.values, quat.fromEuler(quat.create(), 0, 0,  30));
+            break;
+        default:
+            return;
+    }
+    console.log('globalRotation', globalRotation, globalRotation.toRotationMatrix4());
+    event.preventDefault();
+}, true);
+</script>
+<p id="fps" style="position: absolute; top: 0; left: 1em; color: red;"></p>
+<form style="position: absolute; top: .5em; right: .5em; display: grid; grid-template-columns: 7em 5em; background: #aaa; padding: .5em">
+    <label for="advent">Kerzen</label><input type="number" id="advent" value="3" min="0" max="4" oninput="parameters.advent=this.valueAsNumber">
+    <label for="material">Material</label><select id="material" onchange="parameters.material=this.value">
+        <option value="bronze">Bronze</option>
+        <option value="obsidian">Obsidian</option>
+        <option value="gold" selected>Gold</option>
+        <option value="smaragd">Smaragd</option>
+        <option value="jade">Jade</option>
+        <option value="ruby">Rubin</option>
+    </select>
+    <label for="lightColor">Lichtfarbe</label><input type="color" id="lightColor" value="#FFFFFF" oninput="for(const i of[0,1,2])parameters.lightColor[i]=parseInt(this.value.slice(1+2*i,3+2*i),16)/255;">
+    <label for="wireframe">Wireframe</label><input type="checkbox" id="wireframe" onchange="parameters.wireframe=this.checked">
+</form>
+</body>
